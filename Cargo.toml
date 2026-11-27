@@ -18,7 +18,7 @@ qq = ["dep:onebot_v11"]
 wx = ["dep:weixin-agent"]
 
 [dependencies]
-lilyco-core = { git = "https://github.com/Lyco-team/lilyco.git", branch = "main" }
+lilyco-core = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
