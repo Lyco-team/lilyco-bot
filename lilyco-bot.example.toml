@@ -1,0 +1,13 @@
+# Copy this file to `lilyco-bot.toml` (gitignored) and fill in your real Bot token.
+
+app_name = "LilycoBot"
+default_locale = "zh-CN"
+
+[telegram]
+token = "REPLACE_WITH_YOUR_BOT_TOKEN"
+# Optional: HTTP or SOCKS5 proxy for regions where api.telegram.org requires a proxy.
+# proxy = "http://127.0.0.1:7890"
+# Optional: restrict access to specific Telegram numeric user IDs (empty = allow all).
+allowed_users = []
+# Minimum interval between progress editMessageText updates (>= 250 ms).
+progress_throttle_ms = 1500

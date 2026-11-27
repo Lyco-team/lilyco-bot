@@ -15,14 +15,20 @@
 | `qq` | QQ / 群聊 | [`onebot_v11`](https://crates.io/crates/onebot_v11) (`0.1`) | MIT/Apache-2.0 | 适配 NapCat / LLOneBot OneBot v11 协议 |
 | `wx` | 微信 | [`weixin-agent`](https://crates.io/crates/weixin-agent) (`0.3`) | MIT | 纯协议层 WeChat iLink Bot SDK |
 
-## 快速开始（Telegram Bot）
+## 快速开始（Telegram Bot · TOML 配置驱动）
 
 ```bash
-# 1. 运行内置单元测试（验证命令解析、类型转换、Schema 校验与中英文 /help）
-cargo test
+# 1. 运行内置单元测试（含 TOML 严格校验、未知字段拒绝、中英文 ui_messages、进度流）
+cargo test --all-targets
 
-# 2. 启动 Telegram Bot 示例（支持自动读取系统 HTTPS_PROXY / TELOXIDE_PROXY）
-TELOXIDE_TOKEN="你的BotToken" cargo run --example demo_tg
+# 2. 复制模板并填写 [telegram].token（lilyco-bot.toml 已加入 .gitignore）
+cp lilyco-bot.example.toml lilyco-bot.toml
+
+# 3. 验证 Bot Token 与代理连通性
+cargo run --example demo_tg -- --check
+
+# 4. 启动 Telegram Bot（也可指定 --config /path/to/bot.toml）
+cargo run --example demo_tg
 ```
 
 在 Telegram 中发送：

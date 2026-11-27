@@ -15,38 +15,8 @@ use teloxide::net::Download;
 use teloxide::prelude::*;
 use teloxide::types::{BotCommand, InputFile};
 
+use crate::config::TgBotConfig;
 use crate::dispatcher::{BotDispatcher, IncomingMessage};
-
-/// Configuration for running a Lilyco Registry as a Telegram Bot.
-#[derive(Debug, Clone)]
-pub struct TgBotConfig {
-    pub token: String,
-    /// Optional HTTP or SOCKS5 proxy URL (e.g. `http://127.0.0.1:7890` or `socks5://127.0.0.1:1080`).
-    pub proxy: Option<String>,
-    /// Optional allow-list of Telegram user IDs. Empty means allow all users.
-    pub allowed_users: Vec<u64>,
-}
-
-impl TgBotConfig {
-    /// Load from `TELOXIDE_TOKEN` (or `TG_BOT_TOKEN`) and optional `TELOXIDE_PROXY` / `HTTPS_PROXY`.
-    pub fn from_env() -> Result<Self, String> {
-        let token = std::env::var("TELOXIDE_TOKEN")
-            .or_else(|_| std::env::var("TG_BOT_TOKEN"))
-            .map_err(|_| {
-                "Missing TELOXIDE_TOKEN (or TG_BOT_TOKEN) environment variable".to_string()
-            })?;
-        let proxy = std::env::var("TELOXIDE_PROXY")
-            .or_else(|_| std::env::var("HTTPS_PROXY"))
-            .or_else(|_| std::env::var("https_proxy"))
-            .ok()
-            .filter(|s| !s.trim().is_empty());
-        Ok(Self {
-            token,
-            proxy,
-            allowed_users: Vec::new(),
-        })
-    }
-}
 
 fn build_bot(cfg: &TgBotConfig) -> Result<Bot, String> {
     let mut client_builder = reqwest::Client::builder();
@@ -126,10 +96,12 @@ pub async fn run_tg_bot(dispatcher: BotDispatcher, cfg: TgBotConfig) -> Result<(
     }
 
     let disp = Arc::new(dispatcher);
-    let allowed = Arc::new(cfg.allowed_users);
+    let allowed = Arc::new(cfg.allowed_users.clone());
+    let throttle_ms = cfg.progress_throttle_ms;
     tracing::info!(
-        "Lilyco Telegram Bot '{}' started (long polling)",
-        disp.app_name()
+        "Lilyco Telegram Bot '{}' started (long polling, throttle={}ms)",
+        disp.app_name(),
+        throttle_ms
     );
 
     teloxide::repl(bot, move |bot: Bot, msg: Message| {
@@ -169,7 +141,7 @@ pub async fn run_tg_bot(dispatcher: BotDispatcher, cfg: TgBotConfig) -> Result<(
             let progress_task = tokio::spawn(async move {
                 let mut last_edit = Instant::now() - Duration::from_secs(10);
                 while let Some(line) = prx.recv().await {
-                    if last_edit.elapsed() < Duration::from_millis(1500) {
+                    if last_edit.elapsed() < Duration::from_millis(throttle_ms) {
                         continue;
                     }
                     last_edit = Instant::now();
