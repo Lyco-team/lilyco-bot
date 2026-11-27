@@ -253,15 +253,21 @@ fn format_progress(ev: &Progress) -> Option<String> {
             current,
             total: Some(total),
             message,
+            ..
         } if *total > 0 => {
             let pct = ((*current as f64 / *total as f64) * 100.0).min(100.0);
-            Some(format!("⏳ {:.0}% ({}/{}) {}", pct, current, total, message))
+            let msg = message.as_deref().unwrap_or("");
+            Some(format!("⏳ {:.0}% ({}/{}) {}", pct, current, total, msg).trim_end().to_string())
         }
         Progress::Tick {
             current,
             total: None,
             message,
-        } => Some(format!("⏳ #{} {}", current, message)),
+            ..
+        } => {
+            let msg = message.as_deref().unwrap_or("");
+            Some(format!("⏳ #{} {}", current, msg).trim_end().to_string())
+        }
         Progress::Log { message, .. } if !message.trim().is_empty() => {
             Some(format!("📝 {}", message))
         }
