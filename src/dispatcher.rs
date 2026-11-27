@@ -1,11 +1,13 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use lilyco_core::context::Context;
 use lilyco_core::progress::Progress;
-use lilyco_core::registry::Registry;
+use lilyco_core::registry::{RegisteredCommand, Registry};
 use lilyco_core::schema::{ArgKind, CommandSchema};
 use serde_json::{Map, Value};
 use thiserror::Error;
+use tokio::sync::mpsc::UnboundedSender;
 
 /// Platform-agnostic incoming chat message.
 #[derive(Debug, Clone)]
@@ -24,6 +26,8 @@ pub struct IncomingMessage {
 pub struct OutgoingReply {
     pub text: String,
     pub is_error: bool,
+    /// Optional local file path extracted from command output for IM file upload (e.g. `sendDocument`).
+    pub output_file: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -63,15 +67,15 @@ impl BotDispatcher {
 
     /// List visible `(command_name, description)` pairs for platform menu registration
     /// (e.g., Telegram `setMyCommands`).
-    pub fn menu_commands(&self) -> Vec<(String, String)> {
-        let mut items = vec![("help".to_string(), "Show available commands".to_string())];
+    pub fn menu_commands(&self, zh: bool) -> Vec<(String, String)> {
+        let help_desc = if zh {
+            "查看可用命令列表"
+        } else {
+            "Show available commands"
+        };
+        let mut items = vec![("help".to_string(), help_desc.to_string())];
         for cmd in self.registry.visible() {
-            let desc = if cmd.schema.about.is_empty() {
-                format!("Run {}", cmd.name)
-            } else {
-                cmd.schema.about.clone()
-            };
-            // Telegram command names allow [a-z0-9_], max 32 chars.
+            let desc = localized_about(cmd, zh);
             let norm = cmd.name.replace('-', "_");
             items.push((norm, desc));
         }
@@ -104,17 +108,23 @@ impl BotDispatcher {
             } else {
                 format!("/{} {}", cmd.name, args_hint.join(" "))
             };
-            if cmd.schema.about.is_empty() {
-                lines.push(format!("• {}", usage));
-            } else {
-                lines.push(format!("• {} — {}", usage, cmd.schema.about));
-            }
+            let about = localized_about(cmd, zh);
+            lines.push(format!("• {} — {}", usage, about));
         }
         lines.join("\n")
     }
 
     /// Dispatch an [`IncomingMessage`] against the underlying `lilyco_core::Registry`.
     pub async fn handle(&self, msg: IncomingMessage) -> OutgoingReply {
+        self.handle_with_progress(msg, None).await
+    }
+
+    /// Dispatch an [`IncomingMessage`] and optionally stream human-readable progress status lines.
+    pub async fn handle_with_progress(
+        &self,
+        msg: IncomingMessage,
+        progress_tx: Option<UnboundedSender<String>>,
+    ) -> OutgoingReply {
         let zh = msg
             .language_code
             .as_deref()
@@ -122,17 +132,11 @@ impl BotDispatcher {
             .unwrap_or(false);
 
         let trimmed = msg.text.trim();
-        if trimmed.is_empty() {
-            return OutgoingReply {
-                text: self.format_help(zh),
-                is_error: false,
-            };
-        }
-
         let Some((raw_cmd, rest)) = split_command(trimmed) else {
             return OutgoingReply {
                 text: self.format_help(zh),
                 is_error: false,
+                output_file: None,
             };
         };
 
@@ -140,23 +144,27 @@ impl BotDispatcher {
             return OutgoingReply {
                 text: self.format_help(zh),
                 is_error: false,
+                output_file: None,
             };
         }
 
         match self
-            .execute_command(&raw_cmd, rest, msg.attachment_path.as_deref())
+            .execute_command(&raw_cmd, rest, msg.attachment_path.as_deref(), progress_tx)
             .await
         {
             Ok(val) => {
+                let output_file = detect_output_file(&val);
                 let pretty = serde_json::to_string_pretty(&val).unwrap_or_else(|_| val.to_string());
                 OutgoingReply {
                     text: format!("✅ /{}\n{}", raw_cmd, pretty),
                     is_error: false,
+                    output_file,
                 }
             }
             Err(err) => OutgoingReply {
                 text: format!("❌ {}", err),
                 is_error: true,
+                output_file: None,
             },
         }
     }
@@ -166,8 +174,8 @@ impl BotDispatcher {
         raw_cmd: &str,
         rest: &str,
         attachment_path: Option<&str>,
+        progress_tx: Option<UnboundedSender<String>>,
     ) -> Result<Value, BotError> {
-        // Support both `/img_press` (TG menu style) and `/img-press` (canonical kebab-case).
         let canonical = raw_cmd.replace('_', "-");
         let cmd = self
             .registry
@@ -185,14 +193,94 @@ impl BotDispatcher {
             .validate_args(&args)
             .map_err(|e| BotError::InvalidArgs(e.to_string()))?;
 
-        tokio::task::spawn_blocking(move || {
-            let (tx, _rx) = std::sync::mpsc::channel::<Progress>();
-            let ctx = Context::from_sender(tx);
+        let (std_tx, std_rx) = std::sync::mpsc::channel::<Progress>();
+
+        // Forward lilyco_core::Progress events to async progress_tx if supplied.
+        let forwarder = progress_tx.map(|async_tx| {
+            std::thread::spawn(move || {
+                for ev in std_rx {
+                    if let Some(line) = format_progress(&ev) {
+                        let _ = async_tx.send(line);
+                    }
+                }
+            })
+        });
+
+        let res = tokio::task::spawn_blocking(move || {
+            let ctx = Context::from_sender(std_tx);
             (handler)(&ctx, &args).map_err(|e| BotError::Execution(e.to_string()))
         })
         .await
-        .map_err(|e| BotError::Execution(format!("worker panicked: {e}")))?
+        .map_err(|e| BotError::Execution(format!("worker panicked: {e}")))?;
+
+        if let Some(handle) = forwarder {
+            let _ = handle.join();
+        }
+        res
     }
+}
+
+/// Extract `[zh-CN].about` from `cmd.ui_messages` TOML when `zh == true`, falling back to `schema.about`.
+fn localized_about(cmd: &RegisteredCommand, zh: bool) -> String {
+    if zh {
+        if let Some(raw_toml) = cmd.ui_messages {
+            if let Ok(doc) = raw_toml.parse::<toml::Table>() {
+                for key in ["zh-CN", "zh_CN", "zh"] {
+                    if let Some(about) = doc
+                        .get(key)
+                        .and_then(|v| v.as_table())
+                        .and_then(|t| t.get("about"))
+                        .and_then(|v| v.as_str())
+                    {
+                        if !about.trim().is_empty() {
+                            return about.to_string();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if cmd.schema.about.is_empty() {
+        format!("Run {}", cmd.name)
+    } else {
+        cmd.schema.about.clone()
+    }
+}
+
+fn format_progress(ev: &Progress) -> Option<String> {
+    match ev {
+        Progress::Tick {
+            current,
+            total: Some(total),
+            message,
+        } if *total > 0 => {
+            let pct = ((*current as f64 / *total as f64) * 100.0).min(100.0);
+            Some(format!("⏳ {:.0}% ({}/{}) {}", pct, current, total, message))
+        }
+        Progress::Tick {
+            current,
+            total: None,
+            message,
+        } => Some(format!("⏳ #{} {}", current, message)),
+        Progress::Log { message, .. } if !message.trim().is_empty() => {
+            Some(format!("📝 {}", message))
+        }
+        _ => None,
+    }
+}
+
+/// If the handler result JSON contains an existing local file path, return it for IM upload.
+fn detect_output_file(val: &Value) -> Option<String> {
+    let obj = val.as_object()?;
+    for key in ["output_file", "output_path", "output", "file"] {
+        if let Some(path_str) = obj.get(key).and_then(|v| v.as_str()) {
+            let p = Path::new(path_str);
+            if p.is_file() {
+                return Some(path_str.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Split `/cmd@MyBot arg1=val1 arg2=val2` into `("cmd", "arg1=val1 arg2=val2")`.
@@ -216,7 +304,6 @@ fn parse_kv_args(
 ) -> Result<Value, BotError> {
     let mut map = Map::new();
 
-    // Auto-bind attachment to the first Path argument if omitted by user.
     if let Some(path) = attachment_path {
         if let Some(file_arg) = schema
             .args
@@ -241,7 +328,6 @@ fn parse_kv_args(
             .iter()
             .find(|a| a.required && !map.contains_key(&a.name))
         {
-            // Positional convenience: `/echo hello` fills the first unset required arg.
             insert_typed(&mut map, schema, &first_req.name, &tok)?;
         }
     }
@@ -263,7 +349,10 @@ fn insert_typed(
 
     let val = match spec.map(|s| &s.kind) {
         Some(ArgKind::Flag) => {
-            let b = matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+            let b = matches!(
+                raw.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
             Value::Bool(b)
         }
         Some(ArgKind::Number { .. }) => {
@@ -272,7 +361,9 @@ fn insert_typed(
             } else if let Ok(f) = raw.parse::<f64>() {
                 serde_json::Number::from_f64(f)
                     .map(Value::Number)
-                    .ok_or_else(|| BotError::InvalidArgs(format!("{canonical_key} invalid number '{raw}'")))?
+                    .ok_or_else(|| {
+                        BotError::InvalidArgs(format!("{canonical_key} invalid number '{raw}'"))
+                    })?
             } else {
                 return Err(BotError::InvalidArgs(format!(
                     "{canonical_key} expects number, got '{raw}'"
@@ -353,19 +444,22 @@ mod tests {
             subcommands: vec![],
             safety: SafetyTier::default(),
         };
-        let cmd = RegisteredCommand::new("ping-node", schema).with_handler(Arc::new(|_ctx, args| {
-            Ok(serde_json::json!({
-                "host": args.get("host"),
-                "count": args.get("count").cloned().unwrap_or_else(|| serde_json::json!(3)),
-                "ok": true
-            }))
-        }));
+        let mut cmd =
+            RegisteredCommand::new("ping-node", schema).with_handler(Arc::new(|ctx, args| {
+                ctx.tick(1, Some(2), "probing");
+                Ok(serde_json::json!({
+                    "host": args.get("host"),
+                    "count": args.get("count").cloned().unwrap_or_else(|| serde_json::json!(3)),
+                    "ok": true
+                }))
+            }));
+        cmd.ui_messages = Some("[zh-CN]\nabout = \"检测节点延迟\"\n");
         reg.register(cmd).unwrap();
         reg
     }
 
     #[tokio::test]
-    async fn help_lists_visible_commands() {
+    async fn help_uses_ui_messages_zh_cn() {
         let disp = BotDispatcher::new("LilycoDemo", sample_registry());
         let reply = disp
             .handle(IncomingMessage {
@@ -379,29 +473,35 @@ mod tests {
             .await;
         assert!(!reply.is_error);
         assert!(reply.text.contains("/ping-node"));
-        assert!(reply.text.contains("可用命令"));
+        assert!(reply.text.contains("检测节点延迟"));
     }
 
     #[tokio::test]
-    async fn executes_kebab_or_underscore_command_with_type_coercion() {
+    async fn executes_kebab_or_underscore_command_with_progress() {
         let disp = BotDispatcher::new("LilycoDemo", sample_registry());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let reply = disp
-            .handle(IncomingMessage {
-                platform: "tg",
-                chat_id: "42".into(),
-                user_id: "7".into(),
-                language_code: Some("en".into()),
-                text: "/ping_node@MyBot host=example.com count=5".into(),
-                attachment_path: None,
-            })
+            .handle_with_progress(
+                IncomingMessage {
+                    platform: "tg",
+                    chat_id: "42".into(),
+                    user_id: "7".into(),
+                    language_code: Some("en".into()),
+                    text: "/ping_node@MyBot host=example.com count=5".into(),
+                    attachment_path: None,
+                },
+                Some(tx),
+            )
             .await;
         assert!(!reply.is_error, "unexpected error: {}", reply.text);
         assert!(reply.text.contains("\"host\": \"example.com\""));
         assert!(reply.text.contains("\"count\": 5"));
+        let tick = rx.try_recv().expect("should emit progress tick");
+        assert!(tick.contains("50%"));
     }
 
     #[tokio::test]
-    async fn rejects_invalid_int_arg() {
+    async fn rejects_invalid_number_arg() {
         let disp = BotDispatcher::new("LilycoDemo", sample_registry());
         let reply = disp
             .handle(IncomingMessage {

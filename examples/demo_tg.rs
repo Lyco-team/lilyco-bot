@@ -1,11 +1,14 @@
 //! Minimal runnable Telegram Bot example backed by `lilyco_core::Registry`.
 //!
 //! Usage:
+//!   # Verify token & proxy connectivity only:
+//!   TELOXIDE_TOKEN="123456:ABC..." cargo run --example demo_tg -- --check
+//!   # Start live long-polling Telegram bot:
 //!   TELOXIDE_TOKEN="123456:ABC..." cargo run --example demo_tg
 
 use std::sync::Arc;
 
-use lilyco_bot::tg::{run_tg_bot, TgBotConfig};
+use lilyco_bot::tg::{run_tg_bot, verify_tg_token, TgBotConfig};
 use lilyco_bot::BotDispatcher;
 use lilyco_core::registry::{RegisteredCommand, Registry};
 use lilyco_core::safety::SafetyTier;
@@ -61,6 +64,11 @@ async fn main() {
     .expect("register echo command");
 
     let cfg = TgBotConfig::from_env().expect("set TELOXIDE_TOKEN");
+    if std::env::args().any(|a| a == "--check") {
+        let info = verify_tg_token(&cfg).await.expect("getMe failed");
+        println!("Telegram Bot OK: {info}");
+        return;
+    }
     let dispatcher = BotDispatcher::new("LilycoBot", reg);
     run_tg_bot(dispatcher, cfg).await.expect("tg bot error");
 }
